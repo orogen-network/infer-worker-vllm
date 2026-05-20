@@ -18,6 +18,7 @@ class WorkerConfig:
     watchdog_interval_s: float = 5.0
     base_url: str = ""  # filled by uvicorn host after start
     capabilities: list[str] = field(default_factory=lambda: ["mock-model-7b"])
+    gateway_auth_token: str = ""
     # On-disk path to the weights file or HF-style directory. If unset, the
     # weight-hash verification step at startup is skipped (Mock engines have
     # no weights to verify). See `weights.verify_weights`.

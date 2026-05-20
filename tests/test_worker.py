@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from infer_worker_vllm import MockVllmEngine, WorkerConfig, build_app
+from infer_worker_vllm.heartbeat import _gateway_auth_headers
 from infer_worker_vllm.weights import hash_weights, verify_weights
 
 
@@ -44,6 +45,35 @@ def test_healthz(config: WorkerConfig) -> None:
         assert r.json()["operator_id"] == "op-test"
 
 
+def test_replay_endpoint_recomputes_response_hash(config: WorkerConfig) -> None:
+    app = build_app(config)
+    prompt = "hello replay"
+    request_hash = hashlib.sha256(f"{prompt}|{config.model_id}|0|8".encode()).hexdigest()
+    expected = hashlib.sha256(
+        MockVllmEngine(config.model_id).generate(prompt, max_tokens=8, seed=0).text.encode()
+    ).hexdigest()
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/replay",
+            json={
+                "job_id": "j-replay",
+                "model_id": config.model_id,
+                "request_hash": request_hash,
+                "customer_nonce": _nonce(),
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 8,
+                "seed": 0,
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["response_hash"] == expected
+
+
+def test_heartbeat_pusher_includes_gateway_auth(config: WorkerConfig) -> None:
+    config.gateway_auth_token = "gw-secret"
+    assert _gateway_auth_headers(config) == {"Authorization": "Bearer gw-secret"}
+
+
 def test_chat_completions_emits_signed_receipt(config: WorkerConfig) -> None:
     app = build_app(config)
     with TestClient(app) as client:
@@ -64,6 +94,42 @@ def test_chat_completions_emits_signed_receipt(config: WorkerConfig) -> None:
         assert receipt["operator_signature"]
         assert receipt["request_hash"]
         assert receipt["response_hash"]
+
+
+def test_chat_accepts_bare_hex_customer_nonce(config: WorkerConfig) -> None:
+    app = build_app(config)
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": config.model_id,
+                "messages": [{"role": "user", "content": "say hi"}],
+                "customer_nonce": secrets.token_hex(32),
+            },
+        )
+        assert r.status_code == 200, r.text
+
+
+def test_chat_requires_worker_auth_when_token_configured(
+    monkeypatch: pytest.MonkeyPatch, config: WorkerConfig,
+) -> None:
+    monkeypatch.setenv("OROGEN_ENV", "staging")
+    monkeypatch.setenv("OROGEN_WORKER_SKIP_WEIGHT_CHECK", "1")
+    monkeypatch.setenv("WORKER_API_TOKEN", "worker-secret")
+    app = build_app(config)
+    with TestClient(app) as client:
+        body = {
+            "model": config.model_id,
+            "messages": [{"role": "user", "content": "say hi"}],
+            "customer_nonce": _nonce(),
+        }
+        assert client.post("/v1/chat/completions", json=body).status_code == 401
+        ok = client.post(
+            "/v1/chat/completions",
+            json=body,
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+        assert ok.status_code == 200, ok.text
 
 
 def test_chat_rejects_unknown_model(config: WorkerConfig) -> None:
@@ -179,10 +245,11 @@ def test_verify_weights_refuses_placeholder_in_production(monkeypatch, config: W
         verify_weights(config)
 
 
-def test_verify_weights_skips_when_env_flag_set(monkeypatch, config: WorkerConfig) -> None:  # type: ignore[no-untyped-def]
+def test_verify_weights_refuses_skip_flag_in_production(monkeypatch, config: WorkerConfig) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("OROGEN_ENV", "production")
     monkeypatch.setenv("OROGEN_WORKER_SKIP_WEIGHT_CHECK", "1")
-    verify_weights(config)  # no raise
+    with pytest.raises(RuntimeError, match="not allowed"):
+        verify_weights(config)
 
 
 def test_hash_weights_handles_directory(tmp_path) -> None:  # type: ignore[no-untyped-def]

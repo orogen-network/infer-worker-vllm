@@ -9,14 +9,16 @@ Exposes:
 
 from __future__ import annotations
 
+import os
 import secrets
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from mining_types import KvMetadata, LoadSnapshot, Receipt
 from mining_types.crypto import sha256_hex
 from pydantic import BaseModel, Field
@@ -26,10 +28,41 @@ from infer_worker_vllm.engine import MockVllmEngine
 from infer_worker_vllm.heartbeat import HeartbeatPusher, build_heartbeat
 from infer_worker_vllm.weights import verify_weights
 
-
 # H-01: bounded LRU of recently-seen customer_nonces, sized so a busy worker
 # can absorb several minutes of traffic without false-rejects.
 _NONCE_LRU_MAX = 10_000
+_BEARER = HTTPBearer(auto_error=False)
+
+
+def _is_production() -> bool:
+    return os.environ.get("OROGEN_ENV", "").lower() == "production"
+
+
+def _expected_api_token() -> str:
+    return (
+        os.environ.get("WORKER_API_TOKEN", "")
+        or os.environ.get("INTERNAL_AUTH_TOKEN", "")
+    ).strip()
+
+
+async def require_worker_auth(
+    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(_BEARER)] = None,
+) -> None:
+    expected = _expected_api_token()
+    if not expected:
+        if _is_production():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="worker api token not configured",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return
+    if creds is None or creds.scheme.lower() != "bearer" or creds.credentials != expected:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="worker auth required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 class ChatMessage(BaseModel):
@@ -44,7 +77,7 @@ class ChatRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
     max_tokens: int = Field(default=64, ge=1, le=8192)
-    customer_nonce: str = Field(pattern=r"^0x?[a-fA-F0-9]{64}$")
+    customer_nonce: str = Field(pattern=r"^(?:0x)?[a-fA-F0-9]{64}$")
     seed: int = Field(default=0, ge=0, le=2**63 - 1)
 
 
@@ -55,6 +88,21 @@ class ChatResponse(BaseModel):
     choices: list[dict[str, Any]]
     usage: dict[str, int]
     receipt: dict[str, Any]
+
+
+class ReplayRequest(BaseModel):
+    job_id: str
+    model_id: str
+    request_hash: str
+    customer_nonce: str
+    messages: list[ChatMessage]
+    max_tokens: int = Field(default=64, ge=1, le=8192)
+    seed: int = Field(default=0, ge=0, le=2**63 - 1)
+
+
+class ReplayResponse(BaseModel):
+    job_id: str
+    response_hash: str
 
 
 def build_app(config: WorkerConfig, gateway_url: str | None = None) -> FastAPI:
@@ -109,7 +157,11 @@ def build_app(config: WorkerConfig, gateway_url: str | None = None) -> FastAPI:
             return build_heartbeat(config, _load()).model_dump(mode="json")
         return pusher.last_hb.model_dump(mode="json")
 
-    @app.post("/v1/chat/completions", response_model=ChatResponse)
+    @app.post(
+        "/v1/chat/completions",
+        response_model=ChatResponse,
+        dependencies=[Depends(require_worker_auth)],
+    )
     async def chat_completions(req: ChatRequest) -> ChatResponse:
         if req.model != config.model_id:
             raise HTTPException(
@@ -136,7 +188,7 @@ def build_app(config: WorkerConfig, gateway_url: str | None = None) -> FastAPI:
         try:
             result = engine.generate(prompt, max_tokens=req.max_tokens, seed=req.seed)
 
-            req_bytes = (prompt + f"|{req.model}|{req.seed}").encode("utf-8")
+            req_bytes = (prompt + f"|{req.model}|{req.seed}|{req.max_tokens}").encode("utf-8")
             request_hash = sha256_hex(req_bytes)
             response_hash = sha256_hex(result.text.encode("utf-8"))
 
@@ -182,6 +234,28 @@ def build_app(config: WorkerConfig, gateway_url: str | None = None) -> FastAPI:
             )
         finally:
             state["active_requests"] -= 1
+
+    @app.post(
+        "/v1/replay",
+        response_model=ReplayResponse,
+        dependencies=[Depends(require_worker_auth)],
+    )
+    async def replay(req: ReplayRequest) -> ReplayResponse:
+        if req.model_id != config.model_id:
+            raise HTTPException(status_code=400, detail=f"unsupported model {req.model_id!r}")
+        prompt = "\n".join(m.content for m in req.messages)
+        if len(prompt) > 1_000_000:
+            raise HTTPException(status_code=400, detail="prompt too large")
+        request_hash = sha256_hex(
+            (prompt + f"|{req.model_id}|{req.seed}|{req.max_tokens}").encode("utf-8")
+        )
+        if request_hash != req.request_hash:
+            raise HTTPException(status_code=400, detail="request_hash mismatch")
+        result = engine.generate(prompt, max_tokens=req.max_tokens, seed=req.seed)
+        return ReplayResponse(
+            job_id=req.job_id,
+            response_hash=sha256_hex(result.text.encode("utf-8")),
+        )
 
     return app
 
